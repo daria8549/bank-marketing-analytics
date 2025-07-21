@@ -1,0 +1,560 @@
+---
+date: "2024-11-11"
+output:
+  html_document:
+    fig_width: 12
+    fig_height: 12
+  pdf_document: default
+---
+
+*Loading all libraries needed in our project*
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(caret)
+library(e1071) # For Naive Bayes
+library(ggplot2)
+library(readr)
+library(tidymodels)
+library(MASS)
+library(party)
+library(partykit)
+library(ranger)
+library(rpart)        # For regression/decision tree
+library(rpart.plot)
+```
+
+For our project we chose an interesting dataset from a Portuguese bank, which contains results of directed marketing campaigns (phone calls). There are also external socio-economic indicators (16 attributes) of each customer a marketing campaign was directed to. In our project we will build regression and classification models, which take in attributes of customers and predict the outcome of a campaign.
+
+## Data Preparation
+
+Before we begin, we have to transform our dataset into appropriate shape and clean our dataset from any missing or duplicate values.
+We start with loading the dataset into R environment and overview its structure in order to see what we are actually dealing with:
+
+```{r}
+data <- read.csv("./Bank.csv", sep = ";", header = TRUE)
+# View initial data structure
+head(data)
+str(data)
+summary(data)
+```
+As we can see, there are a total of 17 columns in our dataset with column "y" being our target variable, which shows the outcome of a marketing campaign. Other variables show features of targeted customers such as age education, occupation or outcomes of previous campaigns targeted towards this customer. 
+Furthermore, majority of these columns are categorical. Therefore, we will have to transform them into factors before starting our analysis. But before we jump to this, we still have to deal with missing values and duplicate rows in our dataset:
+
+```{r}
+data <- na.omit(data)
+constant_columns <- sapply(data, function(col) length(unique(col)) == 1)
+constant_columns
+```
+Now that our data is clean, we can start transforming categorical columns into factors:
+
+```{r}
+data$job <- as.factor(data$job)
+data$marital <- as.factor(data$marital)
+data$education <- as.factor(data$education)
+data$default <- as.factor(data$default)
+data$housing <- as.factor(data$housing)
+data$loan <- as.factor(data$loan)
+data$contact <- as.factor(data$contact)
+data$month <- as.factor(data$month)
+data$poutcome <- as.factor(data$poutcome)
+data$y <- as.factor(data$y)
+```
+
+Now we have to order our categorical data in a meaningful way.
+
+First, we observe, which features are present in each column:
+
+```{r}
+levels(data$job)
+levels(data$marital)
+levels(data$education)
+levels(data$default)
+levels(data$housing)
+levels(data$loan)
+levels(data$contact)
+levels(data$month)
+levels(data$poutcome)
+levels(data$y)
+```
+Then we order `job`, `month` and `poutcome` columns in desired sequences:
+Job: ordering in terms of job stability
+```{r}
+data$job <- factor(data$job, levels = c("unknown", "unemployed", "student", "housemaid", "retired", 
+                                        "self-employed", "entrepreneur","blue-collar", "services",
+                                        "technician", "management", "admin."))
+```
+Month can be ordered chronologically, from January to December:
+```{r}
+data$month <- factor(data$month, levels = c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))
+```
+Previous Campaign Outcome: "success" over others
+```{r}
+data$poutcome <- factor(data$poutcome, levels = c("unknown", "other", "failure", "success"))
+```
+
+With that finished, data preparation step is done and we can start building our models.
+
+## Modeling
+
+Before we start building any models we have to find correlations between our numeric variables in order to eliminate any highly correlated variables. This can be achieved with the use of a correlation matrix:
+
+```{r}
+numeric_vars <- sapply(data, is.numeric)
+numeric_vars
+correlation_matrix <- cor(data[, numeric_vars])
+correlation_matrix
+```
+
+The variables age, balance, day, duration, campaign, and pdays show very weak correlations with each other, with values generally close to 0
+
+The correlation between pdays and previous is very strong (0.5776), which is interesting. We will remove this column from the dataset in order to avoid overfitting.
+
+```{r}
+data <- data[, !names(data) %in% c("pdays")]
+```
+
+Lastly, we scale numeric columns for better accuracy
+
+```{r}
+numeric_vars <- sapply(data, is.numeric)
+data[numeric_vars] <- scale(data[numeric_vars])
+```
+
+Now, we can finally start with the main body of our project
+
+
+### Linear regression
+
+Firstly, a full model considering all available numeric predictors (logistic regression) will be used to predict subscription (yes or no). 
+
+```{r}
+full_model <- glm(y ~ age + balance + day + duration + campaign + previous, data = data, family = binomial)
+summary(full_model)
+```
+
+Age: A one-year increase in age increases the log-odds of subscribing to the term deposit by 0.0135. In probability terms, older clients are slightly more likely to subscribe.
+
+Duration: The call duration is the most significant predictor. A one-second increase in call duration increases the log-odds of subscription by 0.00362. Longer calls strongly correlate with higher subscription rates.
+
+Previous: For each additional contact during previous campaigns, the log-odds of subscription increase by 0.1547. Positive past interactions increase subscription likelihood.
+
+Non-Significant Predictors: Variables such as balance and day have little to no predictive power in this mode.
+
+### Stepwise model
+
+Now, a Stepwise Logistic Regression will help identify the most relevant predictors by removing less
+significant ones, improving model interpretability.
+
+```{r}
+stepwise_model <- stepAIC(full_model, direction = "both", trace = 0)
+summary(stepwise_model)
+```
+
+It turns out that the difference between the two models is small and likely not practically significant.
+
+### Train-test split
+
+In order to apply the next models, the data will be split into train and test groups.
+80% of the data goes into the train group.
+
+```{r}
+set.seed(123)
+n <- nrow(data)
+m <- 0.8 * n
+train_ind <- sample(1:n, size = m)
+
+train_data <- data[train_ind, ]
+test_data <- data[-train_ind, ]
+```
+
+### Naive Bayes model
+
+The Naive Bayes is simple and works well when the features are independent, which the case with our customer data. This model is useful for marketing campaigns that need quick, probabilistic decision-making.
+
+Because the Naive Bayes performs the best among models (it is shown later), we can try balancing out data and find out, if it affects results significantly.
+upSample - adds more data to the minority class, which helps balance the dataset.
+
+```{r}
+# Scale numeric variables
+data[numeric_vars] <- scale(data[numeric_vars])
+train_data_balanced <- upSample(x = train_data[, -which(names(train_data) == "y")], 
+                                y = train_data$y)
+
+# Class distribution after upsampling
+table(train_data_balanced$y)
+table(train_data_balanced$Class)
+
+# Naive Bayes Model
+naive_model <- naiveBayes(y ~ ., data = train_data)
+naive_model
+naive_model_balanced <- naiveBayes(Class ~ ., data = train_data_balanced)
+naive_model_balanced 
+```
+
+# Key Takeaways from unbalanced data:
+
+Job: 
+"Management" has a higher proportion among "yes" (0.251) compared to "no" (0.209).
+
+Marital status:
+"Married"  have a higher proportion in the "no" class (63.0%) compared to the "yes" class (53.2%).
+"Single"  have a higher proportion in the "yes" class (32.1%) than in the "no" class (25.7%).
+Single customers might be more open to subscription offers. 
+
+Education:
+"Tertiary" education has bigger percentage of "yes" (37.0%) than "no" (28.9%), suggesting that higher educational levels might be associated with subscription.
+
+Balance:
+The mean balance is higher for "yes" (1571.96) than "no" (1403.21), indicating that people with higher account balances are more likely to subscribe.
+
+# Key Takeaways from balanced data:
+
+Age: For 'no' class the log for age is roughly 0.96 for some values, meaning elderly people are not likely to subscribe
+
+Job: blue-collar has a higher probability of belonging to class no (around 0.22) compared to yes (0.12), suggesting that people with blue-collar jobs are more likely NOT to subscribe.
+
+Balance: yes: The log-odds for balance is 0.85, suggesting that higher balances are somewhat indicate subscription.
+
+It was decided that in this case it is better to leave the data unbalanced. While it reflects real-world scenario, balancing the data artificially may distort the reality of the problem. Also in this case false negatives are costly, so  working with unbalanced data may give the model a better sense of the true cost of errors. All in all, for the later research, the data will be left as it is.
+
+### Calculating predictions
+
+Linear regression
+
+```{r}
+p_full_model <- predict(full_model, newdata = test_data, type = "response")
+p_full_model_class <- factor(ifelse(p_full_model > 0.5, "yes", "no"),
+                             levels = c("yes", "no"))
+```
+
+Stepwise model
+
+```{r}
+p_stepwise <- predict(stepwise_model, newdata = test_data, type = "response")
+p_stepwise_class <- factor(ifelse(p_stepwise > 0.5, "yes", "no"),
+                           levels = c("yes", "no"))
+```
+
+Naive Bayes
+
+```{r}
+p_naive_bayes <- predict(naive_model, newdata = test_data)
+p_naive_bayes <- factor(p_naive_bayes, levels = c("yes", "no"))
+
+p_naive_model_balanced <- predict(naive_model_balanced, newdata = test_data)
+p_naive_model_balanced <- factor(p_naive_model_balanced,
+                                 levels = c("yes", "no"))
+```
+
+### k-NN model with Cross-Validation
+
+This non-parametric model is flexible and useful for capturing complex patterns in the data, with cross-validation ensuring better generalization.
+
+```{r}
+fitControl <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+knn_model <- train(y ~ age + job + marital + education + default + balance
+                   + housing + loan + contact + month + duration + campaign
+                   + previous + poutcome,
+                   data = train_data,
+                   method = "knn",
+                   trControl = fitControl,
+                   # Standardizing the predictors
+                   preProc = c("center", "scale"),  
+                   # Hyperparameter tuning for k
+                   tuneGrid = data.frame(k = c(3, 5, 7, 9, 11)))
+knn_model
+```
+
+### k-NN prediction
+
+```{r}
+yhat_knn <- predict(knn_model, newdata = test_data)
+yhat_knn <- factor(yhat_knn, levels = c("yes", "no"))
+```
+
+### Probability Tree
+
+The Probability Tree is a simple and interpretable model. It helps to capture non-linear relationships and can handle both numerical and categorical data. 
+
+```{r}
+prob_tree <- rpart(y ~ ., data = train_data, method = "class", 
+  parms = list(split = "gini"),  # Default splitting criterion
+  control = rpart.control(cp = 0.01))  # Set complexity parameter for pruning
+rpart.plot(prob_tree, type = 3, extra = 104, main = "Probability Tree")
+```
+
+### Random Forest
+
+The Random Forest is an ensemble method that improves decision tree performance by reducing overfitting. Cross-validation ensures model robustness and ability to generalize.
+
+```{r}
+rf_model <- ranger(y ~ ., data = train_data, num.trees = 1000, importance = "permutation")
+importance <- rf_model$variable.importance
+summary(rf_model)
+```
+
+### Variable importance
+
+Let's visualize the importance of each variable calculated by the Random Forest.
+
+```{r}
+barplot(importance[order(importance, decreasing = TRUE)], 
+  main = "Variable Importance", las = 2, col = "skyblue", 
+  cex.names = 0.7)
+```
+```{r}
+table(data$y)
+```
+
+If the target variable (y) is almost constant or highly imbalanced, the random forest might not need multiple trees.
+In this case our dataset is highly imbalanced, with 4000 instances of "no" (negative class) and only 521 instances of "yes" (positive class).
+
+### Partial Dependence Plots
+
+The PDPs are important because they show the relationship between a feature and the predicted outcome while holding other features constant.
+The plots explain how specific features (e.g., duration, income) influence predictions.
+
+```{r}
+# Grid over the range of duration
+grd <- seq(min(data$duration), max(data$duration), length.out = 50)
+nd <- data[sample.int(nrow(data), 1000), ]
+# Predictions
+prs <- lapply(grd, function(val) {
+  nd$duration <- val
+  predict(rf_model, data = nd)$predictions})
+# Aggregate predictions by calculating the mean
+prs_matrix <- do.call("cbind", prs)
+mean_prs <- colMeans(prs_matrix)
+mean_prs
+```
+```{r}
+# Plot for the results
+plot(grd, mean_prs, type = "l", col = rgb(.1, .1, .1, .1), lty =1,lwd = 2,
+     xlab = "Duration (seconds)", ylab = "Predicted Probability of Subscribing",
+     main = "Partial Dependency Plot for Duration")
+```
+
+## Model Evaluation
+
+### MCE for Decision Tree and Random Forest
+
+This metric measures the difference between the predicted and actual values, indicating how well the models make predictions.
+Used in the cross-validation loop to compare the performance of the Random Forest and the Decision Tree.
+
+```{r}
+# MCE for Decision Tree
+p_prob_tree <- predict(prob_tree, newdata = test_data, type = "class")
+mce_tree <- mean(p_prob_tree != test_data$y)
+
+# MCE for Random Forest
+p_rf <- predict(rf_model, data = test_data)$predictions
+mce_rf <- mean(p_rf != test_data$y)
+
+# Combining MCE values into a data frame for visualization
+mce_values <- data.frame(
+  Model = c("Decision Tree", "Random Forest"),
+  MCE = c(mce_tree, mce_rf))
+barplot(
+  mce_values$MCE, 
+  names.arg = mce_values$Model, 
+  col = c("skyblue", "orange"), 
+  main = "Comparison of MCE for Decision Tree and Random Forest", 
+  ylab = "Mean Classification Error (MCE)", 
+  # Adjust y-axis limit to make room for text
+  ylim = c(0, max(mce_values$MCE) + 0.05)  
+)
+```
+
+Decision Tree: The MCE is 0.0972. This means that the Decision Tree model misclassified about 9.72% of the cases in the test data
+Decision Tree has slightly lower MCE, but performance difference between the two models is minimal.
+
+### Confusion matrices
+
+In order to evaluate Recall and Precision, let's calculate the confusion matrices and F1 scores for each model.
+
+```{r}
+# Converting values to factor to match predicted levels
+values <- factor(test_data$y, levels = c("yes", "no"))
+p_prob_tree <- factor(p_prob_tree, levels = levels(values))
+p_rf <- factor(p_prob_tree, levels = levels(values))
+
+# Confusion Matrices
+confusion_full <- confusionMatrix(p_full_model_class, values, positive = "yes")
+confusion_step <- confusionMatrix(p_stepwise_class, values, positive = "yes")
+confusion_nb <- confusionMatrix(p_naive_bayes, values, positive = "yes")
+confusion_nbb <- confusionMatrix(p_naive_model_balanced, values,
+                                 positive = "yes")
+confusion_knn <- confusionMatrix(yhat_knn, values, positive = "yes")
+confusion_tree <- confusionMatrix(p_prob_tree, values, positive = "yes")
+confusion_rf <- confusionMatrix(p_rf, values, positive = "yes")
+# F1 scores from the confusion matrices
+f1_full <- confusion_full$byClass["F1"]
+f1_step <- confusion_step$byClass["F1"]
+f1_nb <- confusion_nb$byClass["F1"]
+f1_nbb <- confusion_nbb$byClass["F1"]
+f1_knn <- confusion_knn$byClass["F1"]
+f1_tree <- confusion_tree$byClass["F1"]
+f1_rf <- confusion_rf$byClass["F1"]
+
+# Combine F1 scores into a vector
+f1_scores <- c(full = f1_full, 
+               stepwise = f1_step, 
+               nb = f1_nb, 
+               nb_balanced = f1_nbb, 
+               knn = f1_knn,
+               tree = f1_tree,
+               rf = f1_rf)
+
+# Print the F1 scores
+print(f1_scores)
+```
+
+### Recall and Precision
+
+The models will also be compared in terms of their Recall and Precision.
+High recall ensures fewer false negatives. Critical in scenarios where missing positive cases is costly (e.g., fraud detection).
+High precision ensures fewer false positives. Important when incorrect positive predictions carry high penalties (e.g., churn prediction).
+
+```{r}
+cat("Full Logistic Regression Model:\n",
+    "Recall:", confusion_full$byClass["Recall"], "\n",
+    "Precision:", confusion_full$byClass["Precision"], "\n\n")
+
+cat("Stepwise Logistic Regression Model:\n",
+    "Recall:", confusion_step$byClass["Recall"], "\n",
+    "Precision:", confusion_step$byClass["Precision"], "\n\n")
+
+cat("Naive Bayes Model:\n",
+    "Recall:", confusion_nb$byClass["Recall"], "\n",
+    "Precision:", confusion_nb$byClass["Precision"], "\n\n")
+
+cat("Naive Bayes Balanced Model:\n",
+    "Recall:", confusion_nbb$byClass["Recall"], "\n",
+    "Precision:", confusion_nbb$byClass["Precision"], "\n\n")
+
+cat("k-NN Model:\n",
+    "Recall:", confusion_knn$byClass["Recall"], "\n",
+    "Precision:", confusion_knn$byClass["Precision"], "\n\n")
+
+cat("Tree Model:\n",
+    "Recall:", confusion_tree$byClass["Recall"], "\n",
+    "Precision:", confusion_tree$byClass["Precision"], "\n\n")
+
+cat("Random Forest:\n",
+    "Recall:", confusion_rf$byClass["Recall"], "\n",
+    "Precision:", confusion_rf$byClass["Precision"], "\n\n")
+```
+
+Metrics suggest that:
+
+The full logistic regression model seems to struggle in making accurate and relevant predictions for the target variable.
+The stepwise logistic regression model suggests a similar level of performance, which means the feature selection process (stepwise) did not lead to much improvement.
+
+The Naive Bayes model performs well in terms of recall, which may be preferable if capturing more true positives is critical, even if it sacrifices some precision and overall accuracy.
+The Naive Bayes (balanced) model suggests that balancing the data did not significantly improve the balance between precision and recall in terms of F1 score.
+
+Decision Tree and Random Forest in terms of recall and precision are equally effective, but Decision Tree could be the better choice because it is easier to visualize, understand, and explain.
+
+### Confusion Matrix Heatmap for the k-NN model
+
+To better visualize the confusion matrix for the k-NN model, a heatmap will be plotted.
+
+```{r}
+conf_matrix_table <- as.table(confusion_knn)
+conf_matrix_df <- as.data.frame(as.table(conf_matrix_table))
+colnames(conf_matrix_df) <- c("Predicted", "Actual", "Freq")
+
+ggplot(conf_matrix_df, aes(x = Predicted, y = Actual)) + 
+  geom_tile(aes(fill = Freq)) + 
+  geom_text(aes(label = Freq), color = "white", size = 5) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme_minimal() + 
+  labs(title = "Confusion Matrix Heatmap - k-NN Model", x = "Predicted",
+       y = "Actual")
+```
+
+### Recall and Precision plots
+
+Finally, for better comparability, Recall and Precision will be visualized for each model.
+
+Recall for each model
+```{r}
+recall_list <- c(
+  full_model = confusionMatrix(p_full_model_class, values)$byClass["Recall"],
+  stepwise_model = confusionMatrix(p_stepwise_class, values)$byClass["Recall"],
+  naive_bayes = confusionMatrix(p_naive_bayes, values)$byClass["Recall"],
+  naive_bayes_balanced = confusionMatrix(p_naive_model_balanced,
+                                         values)$byClass["Recall"],
+  knn = confusionMatrix(yhat_knn, values)$byClass["Recall"],
+  tree = confusionMatrix(p_prob_tree, values)$byClass["Recall"],
+  rf = confusionMatrix(p_rf, values)$byClass["Recall"])
+```
+Bar plot of recall
+```{r}
+barplot_recall <- barplot(recall_list, main = "Model Comparison: Recall",
+                          names.arg = c("Full Model", "Stepweise", "NaiveB",
+                                        "NB_balanced", "KNN", "Prob. tree",
+                                        "Ran. Forest"), 
+                          col = c("blue", "red", "green","grey", "orange",
+                                  "pink", "purple"), 
+                          ylim = c(0, 1), ylab = "Recall",
+                          cex.names = 0.7)
+```
+Precision for each model
+```{r}
+precision_list <- c(
+  full_model = confusionMatrix(p_full_model_class,
+                               values)$byClass["Precision"],
+  stepwise_model = confusionMatrix(p_stepwise_class,
+                                   values)$byClass["Precision"],
+  naive_bayes = confusionMatrix(p_naive_bayes,
+                                values)$byClass["Precision"],
+  naive_bayes_balanced = confusionMatrix(p_naive_model_balanced,
+                                         values)$byClass["Precision"],
+  knn = confusionMatrix(yhat_knn, values)$byClass["Precision"],
+  tree = confusionMatrix(p_prob_tree, values)$byClass["Precision"],
+  rf = confusionMatrix(p_rf, values)$byClass["Precision"])
+```
+Bar plot of precision
+```{r}
+barplot_precision <- barplot(precision_list,
+                             main = "Model Comparison: Precision"
+                             , names.arg = c("Full Model", "Stepweise",
+                                             "NaiveB", "NB_balanced", "KNN",
+                                             "Prob. tree",
+                                             "Ran. Forest"),
+                             col = c("lightblue", "darkred", "lightgreen",
+                                     "darkgrey", "darkorange", "lightpink",
+                                     "purple"), 
+                             ylim = c(0, 1), ylab = "Precision",
+                             cex.names = 0.7)
+```
+As we can see from the plots above. Both Naive Bayes models have by far the best results when evaluating by recall. On the other hand probability tree and random forest have the highest precision out of all.
+
+
+## Conclusion and Interpretation
+
+### Summary of Work Done
+
+In this project, we explored how to predict whether customers would subscribe to term deposits based on a real-world dataset from a Portuguese bank. The dataset included 5,211 records with information about customers' demographics, financial details, and their interactions during past marketing campaigns. To achieve our goal, we followed a structured approach that involved preparing the data, selecting important features, building predictive models, and evaluating their performance.
+
+The first step was data preparation. We cleaned the dataset by addressing imbalances in the target variable, standardizing numerical features like account balance and age, and converting categorical variables, such as job type and marital status, into factors. These steps ensured that the data was in a format suitable for analysis. After this, we conducted feature selection to identify the most important predictors. Using correlation analysis and stepwise regression, we found that features like call duration, previous campaign outcomes, and job type had the strongest influence on whether a customer subscribed to a term deposit.
+
+Next, we implemented several machine learning models to predict customer behavior. These included logistic regression (both full and stepwise), decision trees, random forests, Naive Bayes (applied to both balanced and unbalanced datasets), and k-nearest neighbors (k-NN). Each model was evaluated using metrics such as recall, precision, F1 scores, and mean classification error (MCE). These metrics allowed us to compare how well the models performed in identifying potential subscribers and avoiding incorrect classifications.
+
+### Interpretation of Results
+
+The results of our analysis revealed several important insights. Among the predictors, call duration emerged as the most significant. We found that longer phone calls were strongly correlated with a higher likelihood of subscription. This suggests that when a customer spends more time on the phone with a marketing representative, they are more engaged and likely to subscribe. Another critical factor was the outcome of previous campaigns. If a customer had a positive experience in the past, they were more inclined to subscribe again. Demographics also played a role. For instance, customers working in managerial positions, those with tertiary education, and those with higher account balances were generally more likely to subscribe.
+
+When comparing model performance, we observed some key differences. The Naive Bayes model achieved the highest recall (47.66%), making it particularly useful for identifying potential subscribers. However, this came at the cost of precision, meaning it sometimes incorrectly classified non-subscribers as subscribers. On the other hand, the random forest model demonstrated the best balance between precision and recall, as well as the lowest MCE. This made it a robust choice for predicting subscriptions. Although decision trees were slightly less accurate than random forests, they provided clear and interpretable rules, making them easier to explain to non-technical stakeholders.
+
+One challenge we faced was the imbalance in the dataset. Most customers did not subscribe, which made it harder to identify the smaller group of subscribers. While we tried balancing the data, we ultimately decided to leave it unbalanced, as this better reflected real-world scenarios. In practice, false negatives (missing potential subscribers) are more costly than false positives, so it was important to train the models in a way that prioritized finding subscribers.
+
+### Business Use Case
+
+This project has clear applications for banks and other financial institutions running marketing campaigns for term deposits. By using the insights from our analysis, banks can improve their marketing strategies in several ways. First, they can focus their efforts on customers who are most likely to subscribe, such as those with managerial jobs, higher education, or positive past interactions. This targeted approach can save resources and increase the efficiency of marketing campaigns.
+
+Second, the findings highlight the importance of call duration. Banks could train their marketing representatives to engage customers in longer, more meaningful conversations. Representatives could use this time to build rapport and provide personalized explanations of the benefits of term deposits. For instance, if a customer named Anna is 40 years old, works as a manager, and had a positive experience in a previous campaign, she could be prioritized for outreach. A well-trained representative could take the time to address her specific needs, significantly increasing the chance of conversion.
+
+Third, the models we developed can help banks allocate their resources more effectively. By identifying high-potential leads, banks can reduce the cost of their campaigns while maximizing their return on investment. For example, they could focus on customers who are most likely to say yes while deprioritizing those with a low probability of subscribing.
